@@ -1,100 +1,89 @@
+"""
+Models 3 & 4 — Transfer-Learning ResNet-18 (Frozen / Fine-Tuned)
+==================================================================
+Both models use the exact same architecture:
+
+    torchvision.models.resnet18
+
+with its classification head replaced by ``Linear(512 -> 10)``.
+
+They are NOT different architectures. The only difference between
+Model 3 ("Frozen ResNet-18") and Model 4 ("Fine-Tuned ResNet-18") is
+which parameters were updated during training:
+
+    Model 3 — Frozen ResNet-18 — Transfer Learning
+        backbone:   FROZEN     (requires_grad = False)
+        classifier: TRAINABLE  (requires_grad = True)
+
+    Model 4 — Fine-Tuned ResNet-18 — Transfer Learning
+        backbone:   TRAINABLE  (requires_grad = True)
+        classifier: TRAINABLE  (requires_grad = True)
+
+Source notebook for both: Claude Sol.ipynb
+"""
+
+from typing import Literal
+
 import torch
 import torch.nn as nn
+from torchvision.models import resnet18
 
 
-class BasicBlock(nn.Module):
-    """Custom ResNet BasicBlock used by the scratch-trained ResNet-18."""
-
-    expansion = 1
-
-    def __init__(self, in_channels, out_channels, stride=1):
-        super().__init__()
-
-        self.conv1 = nn.Conv2d(
-            in_channels, out_channels,
-            kernel_size=3, stride=stride, padding=1, bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels,
-            kernel_size=3, stride=1, padding=1, bias=False
-        )
-        self.bn2 = nn.BatchNorm2d(out_channels)
-
-        self.downsample = None
-        if stride != 1 or in_channels != out_channels:
-            self.downsample = nn.Sequential(
-                nn.Conv2d(
-                    in_channels, out_channels,
-                    kernel_size=1, stride=stride, bias=False
-                ),
-                nn.BatchNorm2d(out_channels),
-            )
-
-    def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out = out + identity
-        out = self.relu(out)
-
-        return out
+TrainingMode = Literal["frozen", "fine_tuned"]
 
 
-class CustomResNet18(nn.Module):
+def build_transfer_resnet18(
+    num_classes: int = 10,
+    mode: TrainingMode = "frozen",
+    pretrained: bool = True,
+) -> nn.Module:
     """
-    Custom ResNet-18:
-    3x3 stride-1 stem, no initial 7x7 convolution/max-pool,
-    [2,2,2,2] BasicBlocks, adaptive average pooling, 512->10 head.
+    Build a torchvision ResNet-18 with a replaced classifier head, and set
+    ``requires_grad`` on the backbone according to ``mode``.
+
+    Note: when loading already-trained checkpoints for inference, ``pretrained``
+    should be False (or irrelevant) since ``load_state_dict`` will overwrite the
+    weights anyway. It exists mainly for architectural symmetry / potential
+    from-scratch reconstruction.
     """
+    weights = "IMAGENET1K_V1" if pretrained else None
+    model = resnet18(weights=weights)
 
-    def __init__(self, num_classes=10):
-        super().__init__()
+    # Replace the ImageNet 1000-way classifier with a 10-way EuroSAT classifier.
+    in_features = model.fc.in_features  # 512 for ResNet-18
+    model.fc = nn.Linear(in_features, num_classes)
 
-        self.in_channels = 64
+    set_backbone_trainable(model, trainable=(mode == "fine_tuned"))
 
-        self.conv1 = nn.Conv2d(
-            3, 64, kernel_size=3, stride=1, padding=1, bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
+    return model
 
-        self.layer1 = self._make_layer(64, 2, stride=1)
-        self.layer2 = self._make_layer(128, 2, stride=2)
-        self.layer3 = self._make_layer(256, 2, stride=2)
-        self.layer4 = self._make_layer(512, 2, stride=2)
 
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, num_classes)
+def set_backbone_trainable(model: nn.Module, trainable: bool) -> None:
+    """
+    Freeze or unfreeze every parameter EXCEPT the final classifier (``fc``).
+    The classifier (``fc``) is always left trainable.
+    """
+    for name, param in model.named_parameters():
+        if name.startswith("fc."):
+            param.requires_grad = True
+        else:
+            param.requires_grad = trainable
 
-    def _make_layer(self, out_channels, blocks, stride):
-        layers = [BasicBlock(self.in_channels, out_channels, stride)]
-        self.in_channels = out_channels
-        for _ in range(1, blocks):
-            layers.append(BasicBlock(out_channels, out_channels, stride=1))
-        return nn.Sequential(*layers)
 
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
+def build_frozen_model(num_classes: int = 10) -> nn.Module:
+    """Factory for Model 3 — Frozen ResNet-18 — Transfer Learning."""
+    return build_transfer_resnet18(num_classes=num_classes, mode="frozen", pretrained=False)
 
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
 
-        x = self.avgpool(x)
-        x = x.flatten(1)
-        return self.fc(x)
+def build_fine_tuned_model(num_classes: int = 10) -> nn.Module:
+    """Factory for Model 4 — Fine-Tuned ResNet-18 — Transfer Learning."""
+    return build_transfer_resnet18(num_classes=num_classes, mode="fine_tuned", pretrained=False)
+
+
+def is_backbone_frozen(model: nn.Module) -> bool:
+    """Inspect a loaded model's parameters to determine if the backbone is frozen."""
+    for name, param in model.named_parameters():
+        if not name.startswith("fc."):
+            if param.requires_grad:
+                return False
+    return True
