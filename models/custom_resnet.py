@@ -1,89 +1,147 @@
 """
-Models 3 & 4 — Transfer-Learning ResNet-18 (Frozen / Fine-Tuned)
-==================================================================
-Both models use the exact same architecture:
+Model 2 — Custom ResNet-18 (Trained From Scratch)
+===================================================
+A hand-written ResNet-18 implementation, distinct from
+``torchvision.models.resnet18``. Trained from scratch with random
+initialization on EuroSAT. Source notebook: gemini_sol2(1).ipynb
 
-    torchvision.models.resnet18
+Stem
+----
+Unlike the standard ImageNet stem (7x7 conv, stride 2, + maxpool), this
+custom stem is a single 3x3 convolution:
 
-with its classification head replaced by ``Linear(512 -> 10)``.
+    3 -> 64, kernel 3x3, stride 1, BatchNorm, ReLU
 
-They are NOT different architectures. The only difference between
-Model 3 ("Frozen ResNet-18") and Model 4 ("Fine-Tuned ResNet-18") is
-which parameters were updated during training:
+This is appropriate for the smaller 64x64 EuroSAT input.
 
-    Model 3 — Frozen ResNet-18 — Transfer Learning
-        backbone:   FROZEN     (requires_grad = False)
-        classifier: TRAINABLE  (requires_grad = True)
+Body
+----
+Four residual stages, each made of 2 BasicBlocks (block config [2, 2, 2, 2]):
 
-    Model 4 — Fine-Tuned ResNet-18 — Transfer Learning
-        backbone:   TRAINABLE  (requires_grad = True)
-        classifier: TRAINABLE  (requires_grad = True)
+    Stage 1: 64  channels
+    Stage 2: 128 channels
+    Stage 3: 256 channels
+    Stage 4: 512 channels
 
-Source notebook for both: Claude Sol.ipynb
+Each BasicBlock:
+
+    Conv2D(3x3) -> BatchNorm -> ReLU -> Conv2D(3x3) -> BatchNorm
+        + (identity or 1x1-conv projection skip connection)
+    -> ReLU
+
+Head
+----
+AdaptiveAvgPool2D(1x1) -> Flatten -> Linear(512 -> 10)
 """
-
-from typing import Literal
 
 import torch
 import torch.nn as nn
-from torchvision.models import resnet18
 
 
-TrainingMode = Literal["frozen", "fine_tuned"]
+class BasicBlock(nn.Module):
+    """Standard ResNet BasicBlock with identity or projection skip connection."""
+
+    expansion = 1
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # Projection shortcut is needed whenever spatial size or channel
+        # count changes between the block's input and output.
+        self.downsample = None
+        if stride != 1 or in_channels != out_channels * self.expansion:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels * self.expansion,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels * self.expansion),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out = out + identity
+        out = self.relu(out)
+        return out
 
 
-def build_transfer_resnet18(
-    num_classes: int = 10,
-    mode: TrainingMode = "frozen",
-    pretrained: bool = True,
-) -> nn.Module:
-    """
-    Build a torchvision ResNet-18 with a replaced classifier head, and set
-    ``requires_grad`` on the backbone according to ``mode``.
+class CustomResNet18(nn.Module):
+    """Custom, from-scratch ResNet-18 for EuroSAT 10-class classification."""
 
-    Note: when loading already-trained checkpoints for inference, ``pretrained``
-    should be False (or irrelevant) since ``load_state_dict`` will overwrite the
-    weights anyway. It exists mainly for architectural symmetry / potential
-    from-scratch reconstruction.
-    """
-    weights = "IMAGENET1K_V1" if pretrained else None
-    model = resnet18(weights=weights)
+    def __init__(self, num_classes: int = 10, in_channels: int = 3, block_config=(2, 2, 2, 2)):
+        super().__init__()
 
-    # Replace the ImageNet 1000-way classifier with a 10-way EuroSAT classifier.
-    in_features = model.fc.in_features  # 512 for ResNet-18
-    model.fc = nn.Linear(in_features, num_classes)
+        # Custom stem: 3x3 conv, stride 1 (no 7x7 conv + maxpool like ImageNet ResNets).
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
 
-    set_backbone_trainable(model, trainable=(mode == "fine_tuned"))
+        self.in_channels = 64
+        self.layer1 = self._make_stage(64, block_config[0], stride=1)
+        self.layer2 = self._make_stage(128, block_config[1], stride=2)
+        self.layer3 = self._make_stage(256, block_config[2], stride=2)
+        self.layer4 = self._make_stage(512, block_config[3], stride=2)
 
-    return model
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(512 * BasicBlock.expansion, num_classes)
+
+    def _make_stage(self, out_channels: int, num_blocks: int, stride: int) -> nn.Sequential:
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(BasicBlock(self.in_channels, out_channels, stride=s))
+            self.in_channels = out_channels * BasicBlock.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = self.flatten(x)
+        x = self.fc(x)
+        return x
+
+    def get_residual_stages(self):
+        """Return the four residual stages, useful for architecture visualization."""
+        return {
+            "layer1 (64ch)": self.layer1,
+            "layer2 (128ch)": self.layer2,
+            "layer3 (256ch)": self.layer3,
+            "layer4 (512ch)": self.layer4,
+        }
 
 
-def set_backbone_trainable(model: nn.Module, trainable: bool) -> None:
-    """
-    Freeze or unfreeze every parameter EXCEPT the final classifier (``fc``).
-    The classifier (``fc``) is always left trainable.
-    """
-    for name, param in model.named_parameters():
-        if name.startswith("fc."):
-            param.requires_grad = True
-        else:
-            param.requires_grad = trainable
-
-
-def build_frozen_model(num_classes: int = 10) -> nn.Module:
-    """Factory for Model 3 — Frozen ResNet-18 — Transfer Learning."""
-    return build_transfer_resnet18(num_classes=num_classes, mode="frozen", pretrained=False)
-
-
-def build_fine_tuned_model(num_classes: int = 10) -> nn.Module:
-    """Factory for Model 4 — Fine-Tuned ResNet-18 — Transfer Learning."""
-    return build_transfer_resnet18(num_classes=num_classes, mode="fine_tuned", pretrained=False)
-
-
-def is_backbone_frozen(model: nn.Module) -> bool:
-    """Inspect a loaded model's parameters to determine if the backbone is frozen."""
-    for name, param in model.named_parameters():
-        if not name.startswith("fc."):
-            if param.requires_grad:
-                return False
-    return True
+def build_model(num_classes: int = 10) -> CustomResNet18:
+    """Factory used by the model loader to instantiate this architecture."""
+    return CustomResNet18(num_classes=num_classes)
